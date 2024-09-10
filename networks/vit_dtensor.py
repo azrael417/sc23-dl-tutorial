@@ -3,12 +3,10 @@ import torch
 import torch.nn as nn
 from functools import partial
 from networks.helpers import DropPath, trunc_normal_
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel, SequenceParallel
 
 # mp stuff
 from utils import comm
-from distributed.helpers import compute_split_shapes
-from distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
-from distributed.layers import DistributedMatmul, DistributedMLP, DistributedAttention
 
 class MLP(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -22,9 +20,11 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.fc1(x)
+        
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
+        
         x = self.drop(x)
         return x
 
@@ -38,10 +38,16 @@ class Attention(nn.Module):
             attn_drop=0.,
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
+            device_mesh=None
     ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
+        if device_mesh is not None:
+            self.num_heads_local = num_heads // device_mesh["tp"].size()
+        else:
+            self.num_heads_local = num_heads
+            
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = True 
@@ -55,13 +61,13 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads_local, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
-                q, k, v,
+                q.contiguous(), k.contiguous(), v.contiguous(),
                 dropout_p=self.attn_drop.p,
             )
         else:
@@ -71,7 +77,7 @@ class Attention(nn.Module):
             attn = self.attn_drop(attn)
             x = attn @ v
 
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, self.num_heads_local * self.head_dim).contiguous()
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -80,18 +86,18 @@ class Attention(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 comm_inp_name="none", comm_hidden_name="matmul"):
+                 comm_inp_name="col_matmul", comm_hidden_name="row_matmul", device_mesh=None):
         super().__init__()
 
-        if (comm.get_size(comm_inp_name) * comm.get_size(comm_hidden_name)) > 1:
-            self.attn = DistributedAttention(
-                dim, comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name,
-                num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
-                norm_layer=norm_layer)
-        else:
-            self.attn = Attention(
-                dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
-                norm_layer=norm_layer)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+            norm_layer=norm_layer, device_mesh=device_mesh)
+        if device_mesh is not None:
+            self.attn = parallelize_module(self.attn, device_mesh["tp"],
+                                           {"qkv": ColwiseParallel(),
+                                            "proj": RowwiseParallel(),
+                                           })
+        
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm1 = norm_layer(dim)
@@ -100,21 +106,14 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
          
         # distribute MLP for model parallelism
-        if (comm.get_size(comm_inp_name) * comm.get_size(comm_hidden_name)) > 1:
-            self.mlp = DistributedMLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop,
-                                      comm_inp_name=comm_inp_name,
-                                      comm_hidden_name=comm_hidden_name
-                                      )
-        else:
-            self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        if device_mesh is not None:
+            self.mlp = parallelize_module(self.mlp, device_mesh["tp"], {"fc1": ColwiseParallel(), "fc2": RowwiseParallel()})
 
     def forward(self, x):
-        
         y = self.attn(self.norm1(x))
-        
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        
         return x
 
 
@@ -142,7 +141,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224, 224], patch_size=16, in_chans=3, out_chans=3, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 comm_inp_name="none", comm_hidden_name="matmul", **kwargs):
+                 comm_inp_name="col_matmul", comm_hidden_name="row_matmul", device_mesh=None, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -155,9 +154,6 @@ class VisionTransformer(nn.Module):
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        # compute split shapes for spatial paralellism
-        self.patch_shapes = compute_split_shapes(num_patches, comm.get_size("spatial"))
-
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -167,7 +163,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name)
+                comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name, device_mesh=device_mesh)
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
@@ -210,24 +206,13 @@ class VisionTransformer(nn.Module):
  
     def forward(self, x):
         x = self.prepare_tokens(x)
-
-        # scatter
-        if comm.get_size("spatial") > 1:
-            x = scatter_to_parallel_region(x, 1)
-        
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-
-        # gather
-        if comm.get_size("spatial") > 1:
-            x = gather_from_parallel_region(x, self.patch_shapes, 1)
-        
         x = self.forward_head(x)
-        
         return x
 
-def ViT(params, **kwargs):
+def ViT(params, device_mesh=None, **kwargs):
     model = VisionTransformer(
                    img_size=params.img_size,
                    in_chans=params.n_in_channels, out_chans=params.n_out_channels,
@@ -237,6 +222,7 @@ def ViT(params, **kwargs):
                    drop_path_rate=params.dropout,
                    drop_rate=params.dropout,
                    attn_drop_rate=params.dropout,
+                   device_mesh=device_mesh,
                    **kwargs)
     return model
 

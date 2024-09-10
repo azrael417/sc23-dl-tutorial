@@ -11,8 +11,12 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 import torch.multiprocessing
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import ReduceOp
+
+# TP stuff
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 
 import logging
 from utils import logging_utils
@@ -22,14 +26,11 @@ from utils import get_data_loader_distributed
 from utils import comm
 from utils.loss import l2_loss, l2_loss_opt
 from utils.metrics import weighted_rmse
-from networks import vit
-
-from distributed.mappings import init_ddp_model_and_reduction_hooks
-from distributed.helpers import sync_params
+from networks import vit_dtensor
 
 from utils.plots import generate_images
 
-def train(params, args, local_rank, world_rank, world_size):
+def train(params, args, local_rank, world_rank, world_size, device_mesh):
     # set device and benchmark mode
     torch.backends.cudnn.benchmark = True
     torch.cuda.set_device(local_rank)
@@ -46,8 +47,9 @@ def train(params, args, local_rank, world_rank, world_size):
     val_data_loader, valid_dataset = get_data_loader_distributed(params, params.valid_data_path, params.distributed, train=False)
     logging.info('rank %d, data loader initialized'%(world_rank))
 
-    # create model
-    model = vit.ViT(params).to(device)
+    # create model-parallel model
+    model = vit_dtensor.ViT(params, device_mesh=device_mesh).to(device)
+    
 
     if params.enable_jit:
         model = torch.compile(model)
@@ -55,15 +57,12 @@ def train(params, args, local_rank, world_rank, world_size):
     if params.amp_dtype == torch.float16: 
         scaler = GradScaler()
 
-    # weight initialization needs to be synced across shared weights
-    if comm.get_size("model") > 1:
-        sync_params(model)
-
-    if params.distributed and not args.noddp:
-        model = init_ddp_model_and_reduction_hooks(model, device_ids=[local_rank],
-                                                   output_device=[local_rank],
-                                                   bucket_cap_mb=args.bucket_cap_mb)
-
+    #if params.distributed and not args.noddp:
+    #    model = init_ddp_model_and_reduction_hooks(model, device_ids=[local_rank],
+    #                                               output_device=[local_rank],
+    #                                               bucket_cap_mb=args.bucket_cap_mb)
+    model = DDP(model, device_ids=[local_rank], output_device=[local_rank],
+                bucket_cap_mb=args.bucket_cap_mb, device_mesh=device_mesh["dp"])
 
     if params.enable_fused:
         optimizer = optim.Adam(model.parameters(), lr = params.lr, fused=True, betas=(0.9, 0.95))
@@ -254,8 +253,7 @@ if __name__ == '__main__':
     parser.add_argument("--noddp", action='store_true', help='disable DDP communication')
 
     # model parallelism arguments
-    parser.add_argument("--matmul_parallel_size", default=1, type=int, help="Number of ranks for matmul comms")
-    parser.add_argument("--spatial_parallel_size", default=1, type=int, help="Number of ranks for spatial/sequence comms")
+    parser.add_argument("--row_parallel_size", default=1, type=int, help="Number of row comms")
 
     args = parser.parse_args()
  
@@ -290,16 +288,19 @@ if __name__ == '__main__':
     params.distributed = False
 
     # setup model parallel sizes
-    # we do not use col parallel size for this tutorial, but leave it in 
-    # so that an interested user can begin to extend
     params["model_parallel_sizes"] = [
-        args.matmul_parallel_size,
-        args.spatial_parallel_size
+        1,
+        1,
     ]
-    params["model_parallel_names"] = ["matmul", "spatial"]
+    params["model_parallel_names"] = ["row_matmul", "col_matmul"]
 
     # initialize comm
     comm.init(params, verbose=True)
+
+    # init device mesh
+    model_parallel_size = args.row_parallel_size
+    data_parallel_size = comm.get_world_size() // model_parallel_size
+    device_mesh = init_device_mesh("cuda", (data_parallel_size, model_parallel_size), mesh_dim_names=("dp", "tp"))
 
     # get info from comm
     world_size = comm.get_world_size()
@@ -335,7 +336,7 @@ if __name__ == '__main__':
 
     params.experiment_dir = os.path.abspath(expDir)
 
-    train(params, args, local_rank, world_rank, world_size)
+    train(params, args, local_rank, world_rank, world_size, device_mesh)
 
     if params.distributed:
         torch.distributed.barrier()

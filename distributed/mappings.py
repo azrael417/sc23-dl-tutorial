@@ -4,11 +4,11 @@ from torch.nn.parallel import DistributedDataParallel
 from utils import comm
 
 # torch utils
+from torch.amp import custom_fwd, custom_bwd
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 # helper functions
-from distributed.helpers import _reduce
-
+from distributed.helpers import _reduce, _split, _gather
 
 class _CopyToParallelRegion(torch.autograd.Function):
     """Pass the input to the parallel region."""
@@ -19,11 +19,13 @@ class _CopyToParallelRegion(torch.autograd.Function):
         return input_
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, input_, comm_id_): 
         ctx.comm_id = comm_id_
         return input_
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         if comm.is_distributed(ctx.comm_id):
             return _reduce(grad_output, group=comm.get_group(ctx.comm_id)), None
@@ -43,6 +45,7 @@ class _ReduceFromParallelRegion(torch.autograd.Function):
             return input_
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, input_, comm_id_):  # pragma: no cover
         if comm.is_distributed(comm_id_):
             return _reduce(input_, group=comm.get_group(comm_id_))
@@ -50,8 +53,64 @@ class _ReduceFromParallelRegion(torch.autograd.Function):
             return input_
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):  # pragma: no cover
         return grad_output, None
+
+    
+class _GatherFromParallelRegion(torch.autograd.Function):
+    """Gather the input and keep it on the rank."""
+
+    @staticmethod
+    def symbolic(graph, input_, dim_, shapes_, comm_id_):
+        return _gather(input_, dim_, shapes_, group=comm.get_group(comm_id_))
+
+    @staticmethod
+    @custom_fwd(device_type="cuda")
+    def forward(ctx, input_, dim_, shapes_, comm_id_):
+        if comm.is_distributed(comm_id_):
+            ctx.dim = dim_
+            ctx.comm_id = comm_id_
+            return _gather(input_, dim_, shapes_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
+    @staticmethod
+    @custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output):
+        if comm.is_distributed(ctx.comm_id):
+            return _split(grad_output, ctx.dim, group=comm.get_group(ctx.comm_id)), None, None, None
+        else:
+            return grad_output, None, None, None
+
+        
+class _ScatterToParallelRegion(torch.autograd.Function):
+    """Split the input and keep only the corresponding chunk to the rank."""
+
+    @staticmethod
+    def symbolic(graph, input_, dim_, comm_id_):
+        return _split(input_, dim_, group=comm.get_group(comm_id_))
+
+    @staticmethod
+    @custom_fwd(device_type="cuda")
+    def forward(ctx, input_, dim_, comm_id_):
+        if is_distributed(comm_id_):
+            ctx.dim = dim_
+            ctx.comm_id = comm_id_
+            ctx.split_shapes = compute_split_shapes(
+                input_.shape[dim_], comm.get_size(comm_id_)
+            )
+            return _split(input_, dim_, group=comm.get_group(comm_id_))
+        else:
+            return input_
+
+    @staticmethod
+    @custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output):
+        if is_distributed(ctx.comm_id):
+            return _gather(grad_output, ctx.dim, ctx.split_shapes, group=comm.get_group(ctx.comm_id)), None, None
+        else:
+            return grad_output, None, None
 
      
 # matmul parallel
@@ -65,9 +124,13 @@ def reduce_from_parallel_region(input_, comm_name):  # pragma: no cover
     return _ReduceFromParallelRegion.apply(input_, comm_name)
 
 
-def gather_from_parallel_region(input_, dim, comm_name):
+def gather_from_parallel_region(input_, dim, shapes, comm_name):
     """Parallel gather helper"""
-    return _GatherFromParallelRegion.apply(input_, dim, comm_name)
+    return _GatherFromParallelRegion.apply(input_, dim, shapes, comm_name)
+
+
+def scatter_to_parallel_region(input_, dim_):
+    return _ScatterToParallelRegion.apply(input_, dim_)
 
 
 def init_ddp_model_and_reduction_hooks(model,

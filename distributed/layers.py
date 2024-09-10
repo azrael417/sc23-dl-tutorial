@@ -9,7 +9,7 @@ from networks.helpers import trunc_normal_
 
 # matmul parallel
 from distributed.mappings import copy_to_parallel_region
-from distributed.mappings import gather_from_parallel_region, reduce_from_parallel_region
+from distributed.mappings import reduce_from_parallel_region
 from typing import Tuple
 
 class DistributedMatmul(nn.Module):
@@ -69,13 +69,11 @@ class DistributedMatmul(nn.Module):
     # since this method is full of custom autograd, it cannot be jitted from torch frontend.
     @torch.jit.ignore
     def forward(self, x):
-#        print("before matmul, shape = {}".format(x.shape))
         x_cp = copy_to_parallel_region(x, self.comm_out_name)
         x_loc = F.linear(x_cp, self.weight, bias=None)
         x_out = reduce_from_parallel_region(x_loc, self.comm_inp_name)
         if hasattr(self, "bias"):
             x_out = x_out + self.bias
-#        print("after matmul, shape = {}".format(x_out.shape))
         return x_out
 
     
@@ -171,7 +169,7 @@ class DistributedAttention(nn.Module):
 
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads_local, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = self.q_norm(q).contiguous(), self.k_norm(k).contiguous()
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
@@ -186,7 +184,7 @@ class DistributedAttention(nn.Module):
             x = attn @ v
 
         # transpose back
-        x = x.transpose(1, 2).reshape(B, N, self.num_heads_local * self.head_dim)
+        x = x.transpose(1, 2).reshape(B, N, self.num_heads_local * self.head_dim).contiguous()
 
         # this is distributed again
         x = self.proj(x)
