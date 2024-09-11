@@ -8,8 +8,8 @@ from torch.cuda import amp
 from networks.helpers import trunc_normal_
 
 # matmul parallel
-from distributed.mappings import copy_to_parallel_region
-from distributed.mappings import reduce_from_parallel_region
+from distributed.helpers import compute_split_shapes
+from distributed.mappings import copy_to_parallel_region, reduce_from_parallel_region, scatter_to_parallel_region, gather_from_parallel_region
 from typing import Tuple
 
 class DistributedMatmul(nn.Module):
@@ -125,7 +125,7 @@ class DistributedMLP(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
+        
     
 class DistributedAttention(nn.Module):
     """Distributed Attention layer"""
@@ -133,8 +133,8 @@ class DistributedAttention(nn.Module):
     def __init__(
             self,
             dim,
-            comm_inp_name,
-            comm_hidden_name,
+            comm_head_name,
+            comm_sequence_name,
             num_heads=8,
             qkv_bias=False,
             qk_norm=False,
@@ -148,50 +148,69 @@ class DistributedAttention(nn.Module):
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
 
-        assert num_heads % comm.get_size(comm_hidden_name) == 0, 'heads are not evenly split across model ranks'
-        self.num_heads_local = num_heads // comm.get_size(comm_hidden_name)
+        assert num_heads % comm.get_size(comm_head_name) == 0, 'heads are not evenly split across matmul ranks'
+        self.num_heads_local = num_heads // comm.get_size(comm_head_name)
         self.head_dim = dim // self.num_heads
         self.scale = (dim // self.num_heads) ** -0.5
-        self.fused_attn = True 
+        self.fused_attn = True
 
-        self.comm_inp_name = comm_inp_name
-        self.comm_hidden_name = comm_hidden_name
+        self.comm_head_name = comm_head_name
+        self.comm_sequence_name = comm_sequence_name
+
+        # k and v are not split
+        self.kmul = DistributedMatmul(dim, dim, "none", comm_head_name, bias=qkv_bias)
+        self.vmul = DistributedMatmul(dim, dim, "none", comm_head_name, bias=qkv_bias)
+
+        # we split q spatially
+        self.qmul = DistributedMatmul(dim, dim, "none", comm_head_name, bias=qkv_bias)
         
-        self.qkv = DistributedMatmul(dim, dim * 3, comm_inp_name, comm_hidden_name, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = DistributedMatmul(dim, dim, comm_hidden_name, comm_inp_name, bias=False)
+        self.proj = DistributedMatmul(dim, dim, comm_head_name, "none", bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
+        
 
     def forward(self, x):
         B, N, C = x.shape
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads_local, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q).contiguous(), self.k_norm(k).contiguous()
-
+        split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
+        x_local = scatter_to_parallel_region(x, 1, self.comm_sequence_name)
+        N_local = x_local.shape[1]
+        
+        q = self.qmul(x_local).reshape(B, N_local, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        k = self.kmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        v = self.vmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        
+        #qkv = self.qkv(x).reshape(B, N, 3, self.num_heads_local, self.head_dim).permute(2, 0, 3, 1, 4)
+        #q, k, v = qkv.unbind(0)
+        
+        q, k = self.q_norm(q), self.k_norm(k)
+        
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
+            x_local = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p,
+                scale=self.scale,
             )
         else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
+            attn = q @ k.transpose(-2, -1) * self.scale
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
-            x = attn @ v
+            x_local = attn @ v
 
         # transpose back
-        x = x.transpose(1, 2).reshape(B, N, self.num_heads_local * self.head_dim).contiguous()
+        x_local = x_local.transpose(1, 2).reshape(B, N_local, self.num_heads_local * self.head_dim).contiguous()
 
         # this is distributed again
-        x = self.proj(x)
+        x_local = self.proj(x_local)
 
         # generally we have to be super careful with dropout layers, since
         # those are normalized over the dropouts. That would need to be reduced across nodes
-        x = self.proj_drop(x)
+        x_local = self.proj_drop(x_local)
+
+        split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
+        x = gather_from_parallel_region(x_local, 1, split_shapes, self.comm_sequence_name)
         
         return x
         

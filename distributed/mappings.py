@@ -8,7 +8,7 @@ from torch.amp import custom_fwd, custom_bwd
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 # helper functions
-from distributed.helpers import _reduce, _split, _gather
+from distributed.helpers import compute_split_shapes, _reduce, _split, _gather
 
 class _CopyToParallelRegion(torch.autograd.Function):
     """Pass the input to the parallel region."""
@@ -94,7 +94,7 @@ class _ScatterToParallelRegion(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type="cuda")
     def forward(ctx, input_, dim_, comm_id_):
-        if is_distributed(comm_id_):
+        if comm.is_distributed(comm_id_):
             ctx.dim = dim_
             ctx.comm_id = comm_id_
             ctx.split_shapes = compute_split_shapes(
@@ -107,7 +107,7 @@ class _ScatterToParallelRegion(torch.autograd.Function):
     @staticmethod
     @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        if is_distributed(ctx.comm_id):
+        if comm.is_distributed(ctx.comm_id):
             return _gather(grad_output, ctx.dim, ctx.split_shapes, group=comm.get_group(ctx.comm_id)), None, None
         else:
             return grad_output, None, None
@@ -129,8 +129,8 @@ def gather_from_parallel_region(input_, dim, shapes, comm_name):
     return _GatherFromParallelRegion.apply(input_, dim, shapes, comm_name)
 
 
-def scatter_to_parallel_region(input_, dim_):
-    return _ScatterToParallelRegion.apply(input_, dim_)
+def scatter_to_parallel_region(input_, dim, comm_name):
+    return _ScatterToParallelRegion.apply(input_, dim, comm_name)
 
 
 def init_ddp_model_and_reduction_hooks(model,

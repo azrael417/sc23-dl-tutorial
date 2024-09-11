@@ -85,9 +85,9 @@ class Block(nn.Module):
                  comm_inp_name="none", comm_hidden_name="matmul"):
         super().__init__()
 
-        if (comm.get_size(comm_inp_name) * comm.get_size(comm_hidden_name)) > 1:
+        if comm.get_size("model") > 1:
             self.attn = DistributedAttention(
-                dim, comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name,
+                dim, comm_head_name=comm_hidden_name, comm_sequence_name="spatial",
                 num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
                 norm_layer=norm_layer)
         else:
@@ -215,20 +215,15 @@ class VisionTransformer(nn.Module):
         return x
  
     def forward(self, x):
+        # encode
         x = self.prepare_tokens(x)
 
-        # scatter
-        if comm.get_size("spatial") > 1:
-            x = scatter_to_parallel_region(x, 1)
-        
+        # process
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
 
-        # gather
-        if comm.get_size("spatial") > 1:
-            x = gather_from_parallel_region(x, self.patch_shapes, 1)
-        
+        # decode
         x = self.forward_head(x)
         
         return x
