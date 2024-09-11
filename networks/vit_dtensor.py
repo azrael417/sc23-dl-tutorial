@@ -1,9 +1,13 @@
+import numpy as np
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from functools import partial
 from networks.helpers import DropPath, trunc_normal_
+
+# DTensor stuff
 from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel, SequenceParallel
+from torch.distributed._tensor import Replicate, Shard
 
 # mp stuff
 from utils import comm
@@ -94,8 +98,12 @@ class Block(nn.Module):
             norm_layer=norm_layer, device_mesh=device_mesh)
         if device_mesh is not None:
             self.attn = parallelize_module(self.attn, device_mesh["tp"],
-                                           {"qkv": ColwiseParallel(),
-                                            "proj": RowwiseParallel(),
+                                           {"qkv": ColwiseParallel(
+                                               input_layouts=Replicate(),
+                                               output_layouts=Shard(2)),
+                                            "proj": RowwiseParallel(
+                                                input_layouts=Shard(2),
+                                                output_layouts=Replicate()),
                                            })
         
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -108,7 +116,14 @@ class Block(nn.Module):
         # distribute MLP for model parallelism
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         if device_mesh is not None:
-            self.mlp = parallelize_module(self.mlp, device_mesh["tp"], {"fc1": ColwiseParallel(), "fc2": RowwiseParallel()})
+            self.mlp = parallelize_module(self.mlp, device_mesh["tp"],
+                                          {"fc1": ColwiseParallel(
+                                              input_layouts=Replicate(),
+                                              output_layouts=Shard(2)),
+                                           "fc2": RowwiseParallel(
+                                               input_layouts=Shard(2),
+                                               output_layouts=Replicate())
+                                          })
 
     def forward(self, x):
         y = self.attn(self.norm1(x))
@@ -157,7 +172,7 @@ class VisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = np.linspace(0, drop_path_rate, depth).tolist()  # stochastic depth decay rule
         
         self.blocks = nn.ModuleList([
             Block(
@@ -173,6 +188,11 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(embed_dim, self.out_size, bias=False)
 
         trunc_normal_(self.pos_embed, std=.02)
+
+        self.init_weights()
+        
+
+    def init_weights(self):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):

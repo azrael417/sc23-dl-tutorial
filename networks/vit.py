@@ -1,3 +1,5 @@
+import numpy as np
+
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
@@ -161,7 +163,7 @@ class VisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = np.linspace(0, drop_path_rate, depth).tolist()
         
         self.blocks = nn.ModuleList([
             Block(
@@ -177,6 +179,10 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(embed_dim, self.out_size, bias=False)
 
         trunc_normal_(self.pos_embed, std=.02)
+
+        self.init_weights()
+
+    def init_weights(self):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):

@@ -33,9 +33,8 @@ from utils.plots import generate_images
 def train(params, args, local_rank, world_rank, world_size, device_mesh):
     # set device and benchmark mode
     torch.backends.cudnn.benchmark = True
-    torch.cuda.set_device(local_rank)
     device = torch.device('cuda:%d'%local_rank)
-#    torch.autograd.set_detect_anomaly(True)
+    torch.cuda.set_device(device)
 
     # init pynvml and get handle
     pynvml.nvmlInit()
@@ -48,8 +47,8 @@ def train(params, args, local_rank, world_rank, world_size, device_mesh):
     logging.info('rank %d, data loader initialized'%(world_rank))
 
     # create model-parallel model
+    #with torch.device("meta"):
     model = vit_dtensor.ViT(params, device_mesh=device_mesh).to(device)
-    
 
     if params.enable_jit:
         model = torch.compile(model)
@@ -57,10 +56,6 @@ def train(params, args, local_rank, world_rank, world_size, device_mesh):
     if params.amp_dtype == torch.float16: 
         scaler = GradScaler()
 
-    #if params.distributed and not args.noddp:
-    #    model = init_ddp_model_and_reduction_hooks(model, device_ids=[local_rank],
-    #                                               output_device=[local_rank],
-    #                                               bucket_cap_mb=args.bucket_cap_mb)
     if comm.get_size("data") > 1:
         print("Enabling DDP")
         model = DDP(model, device_ids=[local_rank], output_device=[local_rank],
