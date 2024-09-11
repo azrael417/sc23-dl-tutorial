@@ -82,12 +82,12 @@ class Attention(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 comm_inp_name="none", comm_hidden_name="matmul"):
+                 comm_inp_name="none", comm_hidden_name="matmul", sequence_parallel_shapes=None):
         super().__init__()
 
         if comm.get_size("model") > 1:
             self.attn = DistributedAttention(
-                dim, comm_head_name=comm_hidden_name, comm_sequence_name="spatial",
+                dim, comm_head_name=comm_hidden_name, comm_sequence_name="spatial", sequence_parallel_shapes=sequence_parallel_shapes,
                 num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
                 norm_layer=norm_layer)
         else:
@@ -156,6 +156,7 @@ class VisionTransformer(nn.Module):
 
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
+        self.sequence_parallel_shapes = compute_split_shapes(num_patches, comm.get_size("spatial"))
 
         # compute split shapes for spatial paralellism
         self.patch_shapes = compute_split_shapes(num_patches, comm.get_size("spatial"))
@@ -169,7 +170,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name)
+                comm_inp_name=comm_inp_name, comm_hidden_name=comm_hidden_name, sequence_parallel_shapes=self.sequence_parallel_shapes)
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
@@ -218,10 +219,16 @@ class VisionTransformer(nn.Module):
         # encode
         x = self.prepare_tokens(x)
 
+        # split sequence
+        x = scatter_to_parallel_region(x, 1, "spatial")
+
         # process
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
+
+        # gather sequence
+        x = gather_from_parallel_region(x, 1, self.sequence_parallel_shapes, "spatial")
 
         # decode
         x = self.forward_head(x)

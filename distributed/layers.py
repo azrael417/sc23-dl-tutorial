@@ -135,6 +135,7 @@ class DistributedAttention(nn.Module):
             dim,
             comm_head_name,
             comm_sequence_name,
+            sequence_parallel_shapes,
             num_heads=8,
             qkv_bias=False,
             qk_norm=False,
@@ -147,6 +148,7 @@ class DistributedAttention(nn.Module):
 
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
+        self.sequence_parallel_shapes = sequence_parallel_shapes
 
         assert num_heads % comm.get_size(comm_head_name) == 0, 'heads are not evenly split across matmul ranks'
         self.num_heads_local = num_heads // comm.get_size(comm_head_name)
@@ -171,16 +173,21 @@ class DistributedAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
 
-    def forward(self, x):
-        B, N, C = x.shape
+    def forward(self, x_local):
 
-        split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
-        x_local = scatter_to_parallel_region(x, 1, self.comm_sequence_name)
+        # gather:
+        x = gather_from_parallel_region(x_local, 1, self.sequence_parallel_shapes, self.comm_sequence_name)
+        B, N, C = x.shape
+        k = self.kmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        v = self.vmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+        #split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
+        #x_local = scatter_to_parallel_region(x, 1, self.comm_sequence_name)
         N_local = x_local.shape[1]
         
         q = self.qmul(x_local).reshape(B, N_local, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        k = self.kmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        v = self.vmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        #k = self.kmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        #v = self.vmul(x).reshape(B, N, self.num_heads_local, self.head_dim).permute(0, 2, 1, 3).contiguous()
         
         #qkv = self.qkv(x).reshape(B, N, 3, self.num_heads_local, self.head_dim).permute(2, 0, 3, 1, 4)
         #q, k, v = qkv.unbind(0)
@@ -209,8 +216,8 @@ class DistributedAttention(nn.Module):
         # those are normalized over the dropouts. That would need to be reduced across nodes
         x_local = self.proj_drop(x_local)
 
-        split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
-        x = gather_from_parallel_region(x_local, 1, split_shapes, self.comm_sequence_name)
+        #split_shapes = compute_split_shapes(N, comm.get_size(self.comm_sequence_name))
+        #x = gather_from_parallel_region(x_local, 1, split_shapes, self.comm_sequence_name)
         
-        return x
+        return x_local
         
